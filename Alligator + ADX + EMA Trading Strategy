@@ -1,0 +1,280 @@
+//@version=6
+strategy("Alligator + ADX + 100 EMA Day Trading Strategy", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+         commission_type=strategy.commission.percent, commission_value=0.1,
+         slippage=2)
+
+// ─────────────────────────────────────────────
+// INPUTS — ALLIGATOR
+// ─────────────────────────────────────────────
+jawPeriod    = input.int(13, "Jaw Period (Blue)",   minval=1, group="🐊 Alligator Settings")
+jawShift     = input.int(8,  "Jaw Shift",           minval=0, group="🐊 Alligator Settings")
+teethPeriod  = input.int(8,  "Teeth Period (Red)",  minval=1, group="🐊 Alligator Settings")
+teethShift   = input.int(5,  "Teeth Shift",         minval=0, group="🐊 Alligator Settings")
+lipsPeriod   = input.int(5,  "Lips Period (Green)", minval=1, group="🐊 Alligator Settings")
+lipsShift    = input.int(3,  "Lips Shift",          minval=0, group="🐊 Alligator Settings")
+
+// ─────────────────────────────────────────────
+// INPUTS — ADX
+// ─────────────────────────────────────────────
+adxPeriod    = input.int(14,  "ADX Period",           minval=1,   group="📊 ADX Settings")
+adxThreshold = input.int(20,  "ADX Minimum Threshold (20 or 25)", minval=10, maxval=50, group="📊 ADX Settings")
+showADXPanel = input.bool(true, "Show ADX Panel",                 group="📊 ADX Settings")
+
+// ─────────────────────────────────────────────
+// INPUTS — 100 EMA
+// ─────────────────────────────────────────────
+emaPeriod    = input.int(100, "EMA Period",              minval=1,    group="📈 EMA Settings")
+emaSource    = input.source(close, "EMA Source",                      group="📈 EMA Settings")
+showEMA      = input.bool(true, "Show EMA Line",                      group="📈 EMA Settings")
+strictEMA    = input.bool(true, "Strict EMA Filter (price on correct side)", group="📈 EMA Settings")
+
+// ─────────────────────────────────────────────
+// INPUTS — FILTERS & RISK
+// ─────────────────────────────────────────────
+useAOFilter   = input.bool(true,  "Use Awesome Oscillator Filter", group="🔧 Filter & Risk")
+useFractalEnt = input.bool(true,  "Use Fractal Entry Confirmation", group="🔧 Filter & Risk")
+useATRSL      = input.bool(true,  "Use ATR Stop Loss",             group="🔧 Filter & Risk")
+atrMult       = input.float(1.5,  "ATR Stop Loss Multiplier",      minval=0.5, step=0.1, group="🔧 Filter & Risk")
+atrPeriod     = input.int(14,     "ATR Period",                    minval=1,   group="🔧 Filter & Risk")
+rrRatio       = input.float(2.0,  "Risk:Reward Ratio",             minval=0.5, step=0.1, group="🔧 Filter & Risk")
+showLabels    = input.bool(true,  "Show Entry Labels",             group="🔧 Filter & Risk")
+showBg        = input.bool(true,  "Show Trend Background",         group="🔧 Filter & Risk")
+
+// Date range
+useDateFilter = input.bool(false, "Enable Date Filter",            group="📅 Date Range")
+startDate     = input.time(timestamp("2020-01-01"), "Start Date",  group="📅 Date Range")
+endDate       = input.time(timestamp("2099-12-31"), "End Date",    group="📅 Date Range")
+
+// ─────────────────────────────────────────────
+// ALLIGATOR — SMMA CALCULATION
+// ─────────────────────────────────────────────
+smma(src, length) =>
+    smma = 0.0
+    smaVal = ta.sma(src, length)
+    smma := na(smma[1]) ? smaVal : (smma[1] * (length - 1) + src) / length
+    smma
+
+hl2src = hl2
+
+jaw   = smma(hl2src, jawPeriod)
+teeth = smma(hl2src, teethPeriod)
+lips  = smma(hl2src, lipsPeriod)
+
+jawLine   = jaw[jawShift]
+teethLine = teeth[teethShift]
+lipsLine  = lips[lipsShift]
+
+// ─────────────────────────────────────────────
+// ALLIGATOR STATE
+// ─────────────────────────────────────────────
+bullAwake = lipsLine > teethLine and teethLine > jawLine
+bearAwake = lipsLine < teethLine and teethLine < jawLine
+sleeping  = not bullAwake and not bearAwake
+
+longEntry_prev  = bullAwake and not bullAwake[1]
+shortEntry_prev = bearAwake and not bearAwake[1]
+
+// ─────────────────────────────────────────────
+// 100 EMA
+// ─────────────────────────────────────────────
+ema100 = ta.ema(emaSource, emaPeriod)
+
+// EMA trend filter:
+// Long  → price (close) must be ABOVE the 100 EMA
+// Short → price (close) must be BELOW the 100 EMA
+emaLongOk  = strictEMA ? close > ema100 : true
+emaShortOk = strictEMA ? close < ema100 : true
+
+// Secondary: all alligator lines above EMA (stronger long bias)
+allAboveEMA = jawLine > ema100 and teethLine > ema100 and lipsLine > ema100
+allBelowEMA = jawLine < ema100 and teethLine < ema100 and lipsLine < ema100
+
+// ─────────────────────────────────────────────
+// ADX CALCULATION (Manual — DI+ and DI-)
+// ─────────────────────────────────────────────
+[diPlus, diMinus, adxVal] = ta.dmi(adxPeriod, adxPeriod)
+
+adxStrong    = adxVal >= adxThreshold   // Trend is strong enough
+adxBullish   = diPlus  > diMinus        // Positive DI dominant → bullish momentum
+adxBearish   = diMinus > diPlus         // Negative DI dominant → bearish momentum
+
+adxLongOk    = adxStrong and adxBullish
+adxShortOk   = adxStrong and adxBearish
+
+// ─────────────────────────────────────────────
+// AWESOME OSCILLATOR
+// ─────────────────────────────────────────────
+ao      = ta.sma(hl2, 5) - ta.sma(hl2, 34)
+aoGreen = ao > ao[1]
+aoRed   = ao < ao[1]
+aoAbove = ao > 0
+aoBelow = ao < 0
+
+aoLongOk  = useAOFilter ? (aoGreen and aoAbove) : true
+aoShortOk = useAOFilter ? (aoRed   and aoBelow) : true
+
+// ─────────────────────────────────────────────
+// FRACTALS (Williams 5-bar pivot)
+// ─────────────────────────────────────────────
+fractalUp   = high[2] > high[1] and high[2] > high[3] and high[2] > high[0] and high[2] > high[4]
+fractalDown = low[2]  < low[1]  and low[2]  < low[3]  and low[2]  < low[0]  and low[2]  < low[4]
+
+var float lastFractalHigh = na
+var float lastFractalLow  = na
+if fractalUp
+    lastFractalHigh := high[2]
+if fractalDown
+    lastFractalLow  := low[2]
+
+fractalLongOk  = useFractalEnt ? (not na(lastFractalHigh) and close > lastFractalHigh) : true
+fractalShortOk = useFractalEnt ? (not na(lastFractalLow)  and close < lastFractalLow)  : true
+
+// ─────────────────────────────────────────────
+// ATR
+// ─────────────────────────────────────────────
+atr = ta.atr(atrPeriod)
+
+// ─────────────────────────────────────────────
+// DATE FILTER
+// ─────────────────────────────────────────────
+inDateRange = useDateFilter ? (time >= startDate and time <= endDate) : true
+
+// ─────────────────────────────────────────────
+// COMBINED ENTRY CONDITIONS
+// All 4 systems must align:
+//   ✅ Alligator awake in correct direction
+//   ✅ ADX strong + DI in correct direction
+//   ✅ Price on correct side of 100 EMA
+//   ✅ AO confirms momentum
+//   ✅ Fractal breakout confirms
+// ─────────────────────────────────────────────
+longCondition  = bullAwake and adxLongOk  and emaLongOk  and aoLongOk  and fractalLongOk  and inDateRange
+shortCondition = bearAwake and adxShortOk and emaShortOk and aoShortOk and fractalShortOk and inDateRange
+
+longSignal  = longCondition  and not longCondition[1]
+shortSignal = shortCondition and not shortCondition[1]
+
+// ─────────────────────────────────────────────
+// STOP LOSS & TAKE PROFIT
+// ─────────────────────────────────────────────
+longSL  = useATRSL ? close - atr * atrMult : jawLine
+shortSL = useATRSL ? close + atr * atrMult : jawLine
+longTP  = close + (close - longSL)  * rrRatio
+shortTP = close - (shortSL - close) * rrRatio
+
+// ─────────────────────────────────────────────
+// STRATEGY EXECUTION
+// ─────────────────────────────────────────────
+if longSignal
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+
+if shortSignal
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+// Exit when alligator sleeps or ADX drops weak
+if sleeping or not adxStrong
+    strategy.close_all(comment="Alligator Sleeping / ADX Weak")
+
+// ─────────────────────────────────────────────
+// PLOT — 100 EMA
+// ─────────────────────────────────────────────
+emaPlot = plot(showEMA ? ema100 : na, "100 EMA", color=color.new(color.orange, 0), linewidth=2, style=plot.style_line)
+
+// EMA dynamic zone fill (price vs EMA)
+closePlot = plot(close, display=display.none)
+fill(emaPlot, closePlot,
+     color = close > ema100 ? color.new(color.green, 92) : color.new(color.red, 92),
+     title="Price vs EMA Zone")
+
+// ─────────────────────────────────────────────
+// PLOT — ALLIGATOR LINES
+// ─────────────────────────────────────────────
+plot(jawLine,   "Jaw (Blue)",   color=color.new(color.blue,  0), linewidth=2)
+plot(teethLine, "Teeth (Red)",  color=color.new(color.red,   0), linewidth=2)
+plot(lipsLine,  "Lips (Green)", color=color.new(color.green, 0), linewidth=2)
+
+// ─────────────────────────────────────────────
+// PLOT — FRACTALS
+// ─────────────────────────────────────────────
+plotshape(fractalUp,   "Fractal High", location=location.abovebar, style=shape.triangleup,   color=color.new(color.orange, 30), size=size.tiny, offset=-2)
+plotshape(fractalDown, "Fractal Low",  location=location.belowbar, style=shape.triangledown, color=color.new(color.orange, 30), size=size.tiny, offset=-2)
+
+// ─────────────────────────────────────────────
+// PLOT — ENTRY LABELS
+// ─────────────────────────────────────────────
+plotshape(showLabels and longSignal,  "Buy Label",  location=location.belowbar, style=shape.labelup,   color=color.new(color.green, 0), textcolor=color.white, text="BUY",  size=size.normal)
+plotshape(showLabels and shortSignal, "Sell Label", location=location.abovebar, style=shape.labeldown, color=color.new(color.red,   0), textcolor=color.white, text="SELL", size=size.normal)
+
+// ─────────────────────────────────────────────
+// BACKGROUND — ALLIGATOR STATE
+// ─────────────────────────────────────────────
+bgColor = showBg ? (bullAwake and adxLongOk and emaLongOk ? color.new(color.green, 88) : bearAwake and adxShortOk and emaShortOk ? color.new(color.red, 88) : color.new(color.gray, 95)) : na
+bgcolor(bgColor, title="Confluence Background")
+
+// ─────────────────────────────────────────────
+// ADX PANEL (separate pane)
+// ─────────────────────────────────────────────
+adxColor    = adxVal >= adxThreshold ? color.new(color.yellow, 0) : color.new(color.gray, 40)
+diPlusColor = color.new(color.green, 0)
+diMinColor  = color.new(color.red,   0)
+
+plot(showADXPanel ? adxVal   : na, "ADX",  color=adxColor,    linewidth=2, display=display.pane)
+plot(showADXPanel ? diPlus   : na, "DI+",  color=diPlusColor, linewidth=1, display=display.pane)
+plot(showADXPanel ? diMinus  : na, "DI-",  color=diMinColor,  linewidth=1, display=display.pane)
+hline(adxThreshold, "ADX Threshold", color=color.new(color.white, 40), linestyle=hline.style_dashed, linewidth=1)
+hline(20, "ADX 20", color=color.new(color.gray, 60), linestyle=hline.style_dotted)
+hline(25, "ADX 25", color=color.new(color.gray, 60), linestyle=hline.style_dotted)
+
+// ─────────────────────────────────────────────
+// AWESOME OSCILLATOR PANEL
+// ─────────────────────────────────────────────
+aoColor = ao >= 0 ? (aoGreen ? color.new(color.green, 20) : color.new(color.green, 60)) : (aoRed ? color.new(color.red, 20) : color.new(color.red, 60))
+plot(ao, "AO", style=plot.style_histogram, color=aoColor, linewidth=2, display=display.pane)
+hline(0, "AO Zero", color=color.new(color.gray, 40), linestyle=hline.style_dashed)
+
+// ─────────────────────────────────────────────
+// SIGNAL STRENGTH TABLE (top-right corner)
+// ─────────────────────────────────────────────
+var table dashboard = table.new(position.top_right, 2, 6,
+     bgcolor=color.new(color.black, 60), border_color=color.new(color.gray, 40), border_width=1, frame_color=color.new(color.gray,20), frame_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(dashboard, 0, 0, "SIGNAL CHECK",     text_color=color.white,  text_size=size.small, bgcolor=color.new(color.navy, 20))
+    table.cell(dashboard, 1, 0, "STATUS",            text_color=color.white,  text_size=size.small, bgcolor=color.new(color.navy, 20))
+    // Rows
+    alliColor = bullAwake ? color.new(color.green,30) : bearAwake ? color.new(color.red,30) : color.new(color.gray,40)
+    alliText  = bullAwake ? "▲ BULL"                  : bearAwake ? "▼ BEAR"                : "😴 SLEEP"
+    table.cell(dashboard, 0, 1, "🐊 Alligator",      text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 1, alliText,             text_color=color.white, text_size=size.small, bgcolor=alliColor)
+
+    adxC = adxStrong ? color.new(color.green,30) : color.new(color.red,30)
+    adxT = "ADX " + str.tostring(math.round(adxVal, 1)) + (adxStrong ? " ✅" : " ❌")
+    table.cell(dashboard, 0, 2, "📊 ADX Strength",   text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 2, adxT,                text_color=color.white, text_size=size.small, bgcolor=adxC)
+
+    emaC = emaLongOk  ? color.new(color.green,30) : emaShortOk ? color.new(color.red,30) : color.new(color.gray,40)
+    emaT = close > ema100 ? "Price > EMA ✅" : "Price < EMA ✅"
+    table.cell(dashboard, 0, 3, "📈 100 EMA",        text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 3, emaT,                text_color=color.white, text_size=size.small, bgcolor=emaC)
+
+    aoC = aoLongOk  ? color.new(color.green,30) : aoShortOk ? color.new(color.red,30) : color.new(color.gray,40)
+    aoT = aoAbove ? (aoGreen ? "AO ▲ Above ✅" : "AO ▼ Above") : (aoRed ? "AO ▼ Below ✅" : "AO ▲ Below")
+    table.cell(dashboard, 0, 4, "⚡ Awesome Osc",    text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 4, aoT,                 text_color=color.white, text_size=size.small, bgcolor=aoC)
+
+    overallC = longCondition ? color.new(color.green,10) : shortCondition ? color.new(color.red,10) : color.new(color.gray,40)
+    overallT = longCondition ? "🟢 LONG SETUP"           : shortCondition ? "🔴 SHORT SETUP"         : "⏳ NO SETUP"
+    table.cell(dashboard, 0, 5, "🎯 Signal",         text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy,20))
+    table.cell(dashboard, 1, 5, overallT,            text_color=color.white, text_size=size.small, bgcolor=overallC)
+
+// ─────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────
+alertcondition(longSignal,          title="Alligator+ADX+EMA BUY",   message="✅ BUY: Alligator+ADX+EMA aligned on {{ticker}} @ {{close}}")
+alertcondition(shortSignal,         title="Alligator+ADX+EMA SELL",  message="✅ SELL: Alligator+ADX+EMA aligned on {{ticker}} @ {{close}}")
+alertcondition(sleeping,            title="Alligator Sleeping",       message="⚠️ Alligator sleeping on {{ticker}} — exit trades")
+alertcondition(not adxStrong,       title="ADX Gone Weak",           message="⚠️ ADX dropped below threshold on {{ticker}}")
